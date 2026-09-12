@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 const defaultWaitRetryInterval = time.Second
@@ -29,8 +29,25 @@ type HttpHeader struct {
 	value string
 }
 
+type Config struct {
+	version           bool
+	poll              bool
+	templates         []string
+	stdoutTails       []string
+	stderrTails       []string
+	headersFlag       []string
+	delims            []string
+	headers           []HttpHeader
+	urls              []url.URL
+	waits             []string
+	waitTimeout       time.Duration
+	waitRetryInterval time.Duration
+	noOverwrite       bool
+	args              []string
+}
+
 func (c *Context) Env() map[string]string {
-	env := make(map[string]string)
+	env := make(map[string]string, len(os.Environ()))
 	for _, i := range os.Environ() {
 		sep := strings.Index(i, "=")
 		env[i[0:sep]] = i[sep+1:]
@@ -45,7 +62,6 @@ var (
 	wg           sync.WaitGroup
 
 	templatesFlag     sliceVar
-	templateDirsFlag  sliceVar
 	stdoutTailFlag    sliceVar
 	stderrTailFlag    sliceVar
 	headersFlag       sliceVar
@@ -56,8 +72,8 @@ var (
 	waitFlag          hostFlagsVar
 	waitRetryInterval time.Duration
 	waitTimeoutFlag   time.Duration
-	dependencyChan    chan struct{}
 	noOverwriteFlag   bool
+	dialTimeout       = net.DialTimeout
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -81,6 +97,13 @@ func (s *sliceVar) String() string {
 	return strings.Join(*s, ",")
 }
 
+// drainBody reads any remaining data from a response body and closes it.
+// Errors are deliberately ignored since this is cleanup-only.
+func drainBody(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, body)
+	_ = body.Close()
+}
+
 func waitForDependencies() {
 	dependencyChan := make(chan struct{})
 
@@ -90,70 +113,13 @@ func waitForDependencies() {
 
 			switch u.Scheme {
 			case "file":
-				wg.Add(1)
-				go func(u url.URL) {
-					defer wg.Done()
-					ticker := time.NewTicker(waitRetryInterval)
-					defer ticker.Stop()
-					var err error
-					if _, err = os.Stat(u.Path); err == nil {
-						log.Printf("File %s had been generated\n", u.String())
-						return
-					}
-					for range ticker.C {
-						if _, err = os.Stat(u.Path); err == nil {
-							log.Printf("File %s had been generated\n", u.String())
-							return
-						} else if os.IsNotExist(err) {
-							continue
-						} else {
-							log.Printf("Problem with check file %s exist: %v. Sleeping %s\n", u.String(), err.Error(), waitRetryInterval)
-
-						}
-					}
-				}(u)
+				waitForFile(u)
 			case "tcp", "tcp4", "tcp6":
 				waitForSocket(u.Scheme, u.Host, waitTimeoutFlag)
 			case "unix":
 				waitForSocket(u.Scheme, u.Path, waitTimeoutFlag)
 			case "http", "https":
-				wg.Add(1)
-				go func(u url.URL) {
-					client := &http.Client{
-						Timeout: waitTimeoutFlag,
-					}
-
-					defer wg.Done()
-					for {
-						req, err := http.NewRequest("GET", u.String(), nil)
-						if err != nil {
-							log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), waitRetryInterval)
-							time.Sleep(waitRetryInterval)
-						}
-						if len(headers) > 0 {
-							for _, header := range headers {
-								req.Header.Add(header.name, header.value)
-							}
-						}
-
-						resp, err := client.Do(req)
-						if err != nil {
-							log.Printf("Problem with request: %s. Sleeping %s\n", err.Error(), waitRetryInterval)
-							time.Sleep(waitRetryInterval)
-						} else if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-							log.Printf("Received %d from %s\n", resp.StatusCode, u.String())
-							// dispose the response body and close it.
-							io.Copy(io.Discard, resp.Body)
-							resp.Body.Close()
-							return
-						} else {
-							log.Printf("Received %d from %s. Sleeping %s\n", resp.StatusCode, u.String(), waitRetryInterval)
-							io.Copy(io.Discard, resp.Body)
-							resp.Body.Close()
-							time.Sleep(waitRetryInterval)
-						}
-					}
-				}(u)
+				waitForHTTP(u)
 			default:
 				log.Fatalf("invalid host protocol provided: %s. supported protocols are: tcp, tcp4, tcp6 and http", u.Scheme)
 			}
@@ -171,19 +137,80 @@ func waitForDependencies() {
 
 }
 
+func waitForFile(u url.URL) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(waitRetryInterval)
+		defer ticker.Stop()
+		var err error
+		if _, err = os.Stat(u.Path); err == nil {
+			log.Printf("File %s had been generated\n", u.String())
+			return
+		}
+		for range ticker.C {
+			if _, err = os.Stat(u.Path); err == nil {
+				log.Printf("File %s had been generated\n", u.String())
+				return
+			} else if errors.Is(err, os.ErrNotExist) {
+				continue
+			} else {
+				log.Printf("Problem with check file %s exist: %v. Sleeping %s\n", u.String(), err.Error(), waitRetryInterval)
+			}
+		}
+	}()
+}
+
+func waitForHTTP(u url.URL) {
+	wg.Add(1)
+	go func() {
+		client := &http.Client{
+			Timeout: waitTimeoutFlag,
+		}
+
+		defer wg.Done()
+		for {
+			req, err := http.NewRequest("GET", u.String(), nil)
+			if err != nil {
+				log.Printf("Problem creating request for %s: %v. Sleeping %s\n", u.String(), err.Error(), waitRetryInterval)
+				time.Sleep(waitRetryInterval)
+			}
+			if len(headers) > 0 {
+				for _, header := range headers {
+					req.Header.Add(header.name, header.value)
+				}
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("Problem with request to %s: %s. Sleeping %s\n", u.String(), err.Error(), waitRetryInterval)
+				time.Sleep(waitRetryInterval)
+			} else if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				log.Printf("Received %d from %s\n", resp.StatusCode, u.String())
+				drainBody(resp.Body)
+				return
+			} else {
+				log.Printf("Received %d from %s. Sleeping %s\n", resp.StatusCode, u.String(), waitRetryInterval)
+				drainBody(resp.Body)
+				time.Sleep(waitRetryInterval)
+			}
+		}
+	}()
+}
+
 func waitForSocket(scheme, addr string, timeout time.Duration) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for {
-			conn, err := net.DialTimeout(scheme, addr, waitTimeoutFlag)
+			conn, err := dialTimeout(scheme, addr, timeout)
 			if err != nil {
-				log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), waitRetryInterval)
+				log.Printf("Problem with dial %s://%s: %v. Sleeping %s\n", scheme, addr, err.Error(), waitRetryInterval)
 				time.Sleep(waitRetryInterval)
 			}
 			if conn != nil {
 				log.Printf("Connected to %s://%s\n", scheme, addr)
-				conn.Close()
+				_ = conn.Close()
 				return
 			}
 		}
@@ -217,11 +244,9 @@ Arguments:
 	println(`For more information, see https://github.com/jwilder/dockerize`)
 }
 
-func main() {
-
+func registerFlags() {
 	flag.BoolVar(&version, "version", false, "show version")
 	flag.BoolVar(&poll, "poll", false, "enable polling")
-
 	flag.Var(&templatesFlag, "template", "Template (/template:/dest). Can be passed multiple times. Does also support directories")
 	flag.BoolVar(&noOverwriteFlag, "no-overwrite", false, "Do not overwrite destination file if it already exists.")
 	flag.Var(&stdoutTailFlag, "stdout", "Tails a file to stdout. Can be passed multiple times")
@@ -231,58 +256,93 @@ func main() {
 	flag.Var(&waitFlag, "wait", "Host (tcp/tcp4/tcp6/http/https/unix/file) to wait for before this container starts. Can be passed multiple times. e.g. tcp://db:5432")
 	flag.DurationVar(&waitTimeoutFlag, "timeout", 10*time.Second, "Host wait timeout")
 	flag.DurationVar(&waitRetryInterval, "wait-retry-interval", defaultWaitRetryInterval, "Duration to wait before retrying")
-
 	flag.Usage = usage
-	flag.Parse()
+}
 
-	if version {
-		fmt.Println(buildVersion)
-		return
+func parseDelimiters(value string) ([]string, error) {
+	if value == "" {
+		return nil, nil
 	}
 
-	if flag.NArg() == 0 && flag.NFlag() == 0 {
-		usage()
-		os.Exit(1)
+	delims := strings.Split(value, ":")
+	if len(delims) != 2 {
+		return nil, fmt.Errorf("bad delimiters argument: %s. expected \"left:right\"", value)
 	}
+	return delims, nil
+}
 
-	if delimsFlag != "" {
-		delims = strings.Split(delimsFlag, ":")
-		if len(delims) != 2 {
-			log.Fatalf("bad delimiters argument: %s. expected \"left:right\"", delimsFlag)
-		}
-	}
-
-	for _, host := range waitFlag {
+func parseWaitURLs(hosts hostFlagsVar) ([]url.URL, error) {
+	urls := make([]url.URL, 0, len(hosts))
+	for _, host := range hosts {
 		u, err := url.Parse(host)
 		if err != nil {
-			log.Fatalf("bad hostname provided: %s. %s", host, err.Error())
+			return nil, fmt.Errorf("bad hostname provided: %s. %s", host, err.Error())
 		}
 		urls = append(urls, *u)
 	}
+	return urls, nil
+}
 
-	for _, h := range headersFlag {
-		//validate headers need -wait options
-		if len(waitFlag) == 0 {
-			log.Fatalf("-wait-http-header \"%s\" provided with no -wait option", h)
+func parseHeaders(values []string, waits hostFlagsVar) ([]HttpHeader, error) {
+	headers := make([]HttpHeader, 0, len(values))
+	for _, h := range values {
+		if len(waits) == 0 {
+			return nil, fmt.Errorf("-wait-http-header \"%s\" provided with no -wait option", h)
 		}
 
 		const errMsg = "bad HTTP Headers argument: %s. expected \"headerName: headerValue\""
 		if strings.Contains(h, ":") {
-			parts := strings.Split(h, ":")
+			parts := strings.SplitN(h, ":", 2)
 			if len(parts) != 2 {
-				log.Fatalf(errMsg, headersFlag)
+				return nil, fmt.Errorf(errMsg, h)
 			}
 			headers = append(headers, HttpHeader{name: strings.TrimSpace(parts[0]), value: strings.TrimSpace(parts[1])})
-		} else {
-			log.Fatalf(errMsg, headersFlag)
+			continue
 		}
+		return nil, fmt.Errorf(errMsg, h)
+	}
+	return headers, nil
+}
 
+func parseConfigFromFlags() (Config, error) {
+	parsedDelims, err := parseDelimiters(delimsFlag)
+	if err != nil {
+		return Config{}, err
 	}
 
-	for _, t := range templatesFlag {
+	parsedURLs, err := parseWaitURLs(waitFlag)
+	if err != nil {
+		return Config{}, err
+	}
+
+	parsedHeaders, err := parseHeaders(headersFlag, waitFlag)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return Config{
+		version:           version,
+		poll:              poll,
+		templates:         templatesFlag,
+		stdoutTails:       stdoutTailFlag,
+		stderrTails:       stderrTailFlag,
+		headersFlag:       headersFlag,
+		delims:            parsedDelims,
+		headers:           parsedHeaders,
+		urls:              parsedURLs,
+		waits:             waitFlag,
+		waitTimeout:       waitTimeoutFlag,
+		waitRetryInterval: waitRetryInterval,
+		noOverwrite:       noOverwriteFlag,
+		args:              flag.Args(),
+	}, nil
+}
+
+func processTemplates(templates []string) {
+	for _, t := range templates {
 		template, dest := t, ""
 		if strings.Contains(t, ":") {
-			parts := strings.Split(t, ":")
+			parts := strings.SplitN(t, ":", 2)
 			if len(parts) != 2 {
 				log.Fatalf("bad template argument: %s. expected \"/template:/dest\"", t)
 			}
@@ -299,17 +359,16 @@ func main() {
 			generateFile(template, dest)
 		}
 	}
+}
 
-	waitForDependencies()
-
-	// Setup context
-	ctx, cancel = context.WithCancel(context.Background())
-
+func startCommand(ctx context.Context, cancel context.CancelFunc) {
 	if flag.NArg() > 0 {
 		wg.Add(1)
 		go runCmd(ctx, cancel, flag.Arg(0), flag.Args()[1:]...)
 	}
+}
 
+func startTailers(ctx context.Context) {
 	for _, out := range stdoutTailFlag {
 		wg.Add(1)
 		go tailFile(ctx, out, poll, os.Stdout)
@@ -319,6 +378,42 @@ func main() {
 		wg.Add(1)
 		go tailFile(ctx, err, poll, os.Stderr)
 	}
+}
+
+func main() {
+	registerFlags()
+	flag.Parse()
+
+	config, err := parseConfigFromFlags()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	delims = config.delims
+	headers = config.headers
+	urls = config.urls
+	waitFlag = config.waits
+	waitTimeoutFlag = config.waitTimeout
+	waitRetryInterval = config.waitRetryInterval
+	noOverwriteFlag = config.noOverwrite
+	poll = config.poll
+
+	if config.version {
+		fmt.Println(buildVersion)
+		return
+	}
+
+	if flag.NArg() == 0 && flag.NFlag() == 0 {
+		usage()
+		os.Exit(1)
+	}
+
+	processTemplates(config.templates)
+	waitForDependencies()
+
+	ctx, cancel = context.WithCancel(context.Background())
+	startCommand(ctx, cancel)
+	startTailers(ctx)
 
 	wg.Wait()
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -11,7 +12,7 @@ import (
 	"syscall"
 	"text/template"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 	"github.com/jwilder/gojq"
 )
 
@@ -20,10 +21,10 @@ func exists(path string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
-	return false, err
+	return false, fmt.Errorf("unable to stat %s: %w", path, err)
 }
 
 func contains(item map[string]string, key string) bool {
@@ -33,24 +34,26 @@ func contains(item map[string]string, key string) bool {
 	return false
 }
 
-func defaultValue(args ...interface{}) (string, error) {
+func defaultValue(args ...any) (string, error) {
 	if len(args) == 0 {
-		return "", fmt.Errorf("default called with no values!")
+		return "", fmt.Errorf("default called with no values")
 	}
 
 	if len(args) > 0 {
 		if args[0] != nil {
-			return args[0].(string), nil
+			if s, ok := args[0].(string); ok {
+				return s, nil
+			}
 		}
 	}
 
 	if len(args) > 1 {
 		if args[1] == nil {
-			return "", fmt.Errorf("default called with nil default value!")
+			return "", fmt.Errorf("default called with nil default value")
 		}
 
 		if _, ok := args[1].(string); !ok {
-			return "", fmt.Errorf("default is not a string value. hint: surround it w/ double quotes.")
+			return "", fmt.Errorf("default is not a string value, hint: surround it with double quotes")
 		}
 
 		return args[1].(string), nil
@@ -72,21 +75,29 @@ func add(arg1, arg2 int) int {
 }
 
 func isTrue(s string) bool {
-	b, err := strconv.ParseBool(strings.ToLower(s))
-	if err == nil {
-		return b
+	lower := strings.ToLower(s)
+	switch lower {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		b, err := strconv.ParseBool(lower)
+		if err == nil {
+			return b
+		}
+		return false
 	}
-	return false
 }
 
-func jsonQuery(jsonObj string, query string) (interface{}, error) {
+func jsonQuery(jsonObj string, query string) (any, error) {
 	parser, err := gojq.NewStringQuery(jsonObj)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("unable to parse JSON object %s: %w", jsonObj, err)
 	}
 	res, err := parser.Query(query)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("unable to query JSON object %s with %s: %w", jsonObj, query, err)
 	}
 	return res, nil
 }
@@ -105,7 +116,7 @@ func loop(args ...int) (<-chan int, error) {
 			", but got %d", len(args))
 	}
 
-	c := make(chan int)
+	c := make(chan int, 16)
 	go func() {
 		for i := start; i < stop; i += step {
 			c <- i
@@ -143,7 +154,7 @@ func generateFile(templatePath, destPath string) bool {
 	}
 	tmpl, err := tmpl.ParseFiles(templatePath)
 	if err != nil {
-		log.Fatalf("unable to parse template: %s", err)
+		log.Fatalf("unable to parse template %s, error: %s", templatePath, err)
 	}
 
 	// Don't overwrite destination file if it exists and no-overwrite flag passed
@@ -155,22 +166,22 @@ func generateFile(templatePath, destPath string) bool {
 	if destPath != "" {
 		dest, err = os.Create(destPath)
 		if err != nil {
-			log.Fatalf("unable to create %s", err)
+			log.Fatalf("unable to create %s, error: %s", destPath, err)
 		}
 		defer dest.Close()
 	}
 
 	err = tmpl.ExecuteTemplate(dest, filepath.Base(templatePath), &Context{})
 	if err != nil {
-		log.Fatalf("template error: %s\n", err)
+		log.Fatalf("template error %s, error: %s\n", templatePath, err)
 	}
 
 	if fi, err := os.Stat(destPath); err == nil {
 		if err := dest.Chmod(fi.Mode()); err != nil {
-			log.Fatalf("unable to chmod temp file: %s\n", err)
+			log.Fatalf("unable to chmod temp file %s: %s\n", destPath, err)
 		}
 		if err := dest.Chown(int(fi.Sys().(*syscall.Stat_t).Uid), int(fi.Sys().(*syscall.Stat_t).Gid)); err != nil {
-			log.Fatalf("unable to chown temp file: %s\n", err)
+			log.Fatalf("unable to chown temp file %s: %s\n", destPath, err)
 		}
 	}
 
